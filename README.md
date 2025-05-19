@@ -11,7 +11,7 @@ This plugin kit includes the following Maya plugins:
 All plugins are programmed in Python, functioning, and compatible with Maya 2024
 Instructions: Copy, paste and execute the code into your Maya script editor. The UI will launch automatically.
 
-Plugin descriptions:
+**Plugin descriptions:**
 
 - Notes and Markup: Draw and comment on viewport screenshots saved to any frame of your Maya animation.
 - Keyframe Info: View and edit all relevant keyframe information.
