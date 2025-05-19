@@ -1,0 +1,420 @@
+from PySide2 import QtWidgets, QtGui, QtCore
+from maya import OpenMayaUI as omui
+from maya import OpenMayaRender as omr
+from maya import OpenMaya as om
+from maya import cmds
+from shiboken2 import wrapInstance
+import os
+import json
+
+# Helper to get Maya main window
+def get_maya_main_window():
+    main_window_ptr = omui.MQtUtil.mainWindow()
+    if main_window_ptr is not None:
+        return wrapInstance(int(main_window_ptr), QtWidgets.QMainWindow)
+    return None
+
+SAVE_PATH = os.path.join(cmds.internalVar(userAppDir=True), "canvas_notes.json")
+COMMENT_PATH = os.path.join(cmds.internalVar(userAppDir=True), "frame_comments.json")
+
+class DrawingCanvas(QtWidgets.QLabel):
+    def __init__(self, parent=None):
+        super(DrawingCanvas, self).__init__(parent)
+        self.setCursor(QtGui.QCursor(QtCore.Qt.CrossCursor))
+        self.setFixedSize(500, 500)
+        self.canvas_per_frame = {}
+        self.comments_per_frame = {}
+        self.default_pixmap = QtGui.QPixmap(self.size())
+        self.default_pixmap.fill(QtGui.QColor(60, 60, 60))
+        self.canvas_pixmap = self.default_pixmap.copy()
+        self.setPixmap(self.canvas_pixmap)
+        self.last_pos = None
+        self.drawing = True
+        self.pen_color = QtCore.Qt.black
+        self.eraser_color = QtGui.QColor(60, 60, 60)
+        self.pen_width = 3
+        self.undo_stack = []
+        self.current_frame = int(cmds.currentTime(q=True))
+        self.comment_box = None
+        self.frame_display = None
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.check_frame_change)
+        self.timer.start(200)
+        self.load_all_canvases()
+        self.load_all_comments()
+
+    def set_comment_box(self, box):
+        self.comment_box = box
+        self.update_comment_box()
+
+    def set_frame_display_label(self, label):
+        self.frame_display = label
+        self.update_frame_display()
+
+    def update_frame_display(self):
+        if self.frame_display:
+            self.frame_display.setText(f"Current Frame: {self.current_frame}")
+
+    def update_comment_box(self):
+        if self.comment_box:
+            self.comment_box.setPlainText(self.comments_per_frame.get(self.current_frame, ""))
+
+    def check_frame_change(self):
+        new_frame = int(cmds.currentTime(q=True))
+        if new_frame != self.current_frame:
+            self.store_current_canvas()
+            self.store_current_comment()
+            self.current_frame = new_frame
+            self.load_canvas_for_frame(new_frame)
+            self.update_comment_box()
+            self.update_frame_display()
+
+    def store_current_canvas(self):
+        if self.canvas_pixmap.toImage() != self.default_pixmap.toImage():
+            self.canvas_per_frame[self.current_frame] = self.canvas_pixmap.copy()
+            self.save_all_canvases()
+
+    def store_current_comment(self):
+        if self.comment_box:
+            text = self.comment_box.toPlainText()
+            if text.strip():
+                self.comments_per_frame[self.current_frame] = text.strip()
+            elif self.current_frame in self.comments_per_frame:
+                del self.comments_per_frame[self.current_frame]
+            self.save_all_comments()
+
+    def load_canvas_for_frame(self, frame):
+        self.canvas_pixmap = self.canvas_per_frame.get(frame, self.default_pixmap.copy())
+        self.setPixmap(self.canvas_pixmap)
+        self.update()
+
+    def get_frames_with_notes(self):
+        frames = set(f for f, img in self.canvas_per_frame.items() if not img.toImage() == self.default_pixmap.toImage())
+        frames.update(self.comments_per_frame.keys())
+        return sorted(frames)
+
+    def jump_to_frame(self, frame):
+        self.store_current_canvas()
+        self.store_current_comment()
+        cmds.currentTime(frame, edit=True)
+        self.load_canvas_for_frame(frame)
+        self.update_comment_box()
+        self.update_frame_display()
+
+    def clear_all_canvases(self):
+        self.canvas_per_frame.clear()
+        self.comments_per_frame.clear()
+        self.canvas_pixmap = self.default_pixmap.copy()
+        self.setPixmap(self.canvas_pixmap)
+        self.update()
+        self.save_all_canvases()
+        self.save_all_comments()
+        if self.comment_box:
+            self.comment_box.setPlainText("")
+
+    def set_drawing_mode(self, drawing=True):
+        self.drawing = drawing
+        if drawing:
+            self.setCursor(QtGui.QCursor(QtCore.Qt.CrossCursor))
+        else:
+            self.setCursor(QtGui.QCursor(QtCore.Qt.OpenHandCursor))
+
+    def set_pen_width(self, width):
+        self.pen_width = max(1, min(10, width))
+
+    def set_pen_color(self, color):
+        self.pen_color = color
+
+    def reset_canvas(self):
+        self.canvas_pixmap = self.default_pixmap.copy()
+        self.setPixmap(self.canvas_pixmap)
+        self.update()
+        self.undo_stack.clear()
+
+    def save_to_image(self):
+        filepath, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Image", "", "PNG Files (*.png)")
+        if filepath:
+            comment_text = self.comments_per_frame.get(self.current_frame, "")
+            width = self.canvas_pixmap.width()
+            height = self.canvas_pixmap.height() + 120
+            final_image = QtGui.QImage(width, height, QtGui.QImage.Format_ARGB32)
+            final_image.fill(QtCore.Qt.white)
+
+            painter = QtGui.QPainter(final_image)
+            painter.drawPixmap(0, 0, self.canvas_pixmap)
+            font = QtGui.QFont("Arial", 10)
+            painter.setFont(font)
+            painter.setPen(QtCore.Qt.black)
+            painter.drawText(10, self.canvas_pixmap.height() + 15, f"Frame: {self.current_frame}")
+            if comment_text.strip():
+                text_rect = QtCore.QRect(10, self.canvas_pixmap.height() + 30, width - 20, 90)
+                painter.drawText(text_rect, QtCore.Qt.TextWordWrap, comment_text)
+            painter.end()
+            final_image.save(filepath, "PNG")
+
+    def save_all_canvases(self):
+        data = {}
+        for frame, pixmap in self.canvas_per_frame.items():
+            image_path = os.path.join(cmds.internalVar(userAppDir=True), f"canvas_frame_{frame}.png")
+            pixmap.save(image_path, "PNG")
+            data[frame] = image_path
+        with open(SAVE_PATH, "w") as f:
+            json.dump(data, f)
+
+    def load_all_canvases(self):
+        if os.path.exists(SAVE_PATH):
+            try:
+                with open(SAVE_PATH, "r") as f:
+                    data = json.load(f)
+                for frame_str, path in data.items():
+                    if os.path.exists(path):
+                        pixmap = QtGui.QPixmap(path)
+                        self.canvas_per_frame[int(frame_str)] = pixmap
+            except:
+                pass
+
+    def save_all_comments(self):
+        with open(COMMENT_PATH, "w") as f:
+            json.dump(self.comments_per_frame, f)
+
+    def load_all_comments(self):
+        if os.path.exists(COMMENT_PATH):
+            try:
+                with open(COMMENT_PATH, "r") as f:
+                    self.comments_per_frame = {int(k): v for k, v in json.load(f).items()}
+            except:
+                self.comments_per_frame = {}
+
+    def undo(self):
+        if self.undo_stack:
+            self.canvas_pixmap = self.undo_stack.pop()
+            self.setPixmap(self.canvas_pixmap)
+            self.update()
+
+    def import_viewport_screenshot(self):
+        temp_path = os.path.join(cmds.internalVar(userTmpDir=True), "viewport_capture.png")
+        cmds.playblast(completeFilename=temp_path, forceOverwrite=True, format='image', width=500, height=500, showOrnaments=False, viewer=False, frame=cmds.currentTime(q=True), percent=100)
+        if os.path.exists(temp_path):
+            screenshot = QtGui.QPixmap(temp_path)
+            base = QtGui.QPixmap(self.size())
+            base.fill(QtGui.QColor(60, 60, 60))
+            painter = QtGui.QPainter(base)
+            painter.drawPixmap(0, 0, screenshot)
+            painter.end()
+            self.canvas_pixmap = base
+            self.setPixmap(self.canvas_pixmap)
+            self.update()
+            self.store_current_canvas()  # Fix: Save screenshot immediately
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self.last_pos = event.pos()
+            self.undo_stack.append(self.canvas_pixmap.copy())
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & QtCore.Qt.LeftButton and self.last_pos is not None:
+            painter = QtGui.QPainter(self.canvas_pixmap)
+            color = self.pen_color if self.drawing else self.eraser_color
+            pen = QtGui.QPen(color, self.pen_width, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin)
+            painter.setPen(pen)
+            painter.drawLine(self.last_pos, event.pos())
+            painter.end()
+            self.setPixmap(self.canvas_pixmap)
+            self.last_pos = event.pos()
+
+    def mouseReleaseEvent(self, event):
+        self.last_pos = None
+
+class DrawingToolUI(QtWidgets.QDialog):
+    def update_char_count(self):
+        text = self.comment_box.toPlainText()
+        if len(text) > 200:
+            self.comment_box.setPlainText(text[:200])
+            cursor = self.comment_box.textCursor()
+            cursor.movePosition(QtGui.QTextCursor.End)
+            self.comment_box.setTextCursor(cursor)
+        if hasattr(self, 'char_count_label'):
+            self.char_count_label.setText(f"{len(self.comment_box.toPlainText())} / 200")
+
+    def eventFilter(self, source, event):
+        if source == self.comment_box:
+            if event.type() == QtCore.QEvent.FocusOut:
+                self.canvas.store_current_comment()
+            elif event.type() == QtCore.QEvent.KeyPress and event.key() == QtCore.Qt.Key_Return and not (event.modifiers() & QtCore.Qt.ShiftModifier):
+                self.canvas.store_current_comment()
+                self.comment_box.clearFocus()
+                return True
+        elif source == self.canvas:
+            if event.type() == QtCore.QEvent.MouseButtonPress:
+                if self.comment_box.hasFocus():
+                    self.canvas.store_current_comment()
+                    self.comment_box.clearFocus()
+        return QtWidgets.QDialog.eventFilter(self, source, event)
+
+    _instance = None
+
+    def __init__(self, parent=get_maya_main_window()):
+        if DrawingToolUI._instance is not None:
+            try:
+                DrawingToolUI._instance.close()
+                DrawingToolUI._instance.deleteLater()
+            except:
+                pass
+
+        super(DrawingToolUI, self).__init__(parent)
+        self.setWindowTitle("Notes and Markup")
+        self.setMinimumSize(520, 800)
+        self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.WindowTitleHint | QtCore.Qt.CustomizeWindowHint | QtCore.Qt.WindowCloseButtonHint)
+        DrawingToolUI._instance = self
+
+        self.canvas = DrawingCanvas(self)
+        self.frame_label = QtWidgets.QLabel()
+        self.frame_label.setStyleSheet("padding: 4px 8px; font-size: 10px; font-family: 'Segoe UI'; font-weight: normal;")
+        self.canvas.set_frame_display_label(self.frame_label)
+
+        self.comment_box = QtWidgets.QPlainTextEdit()
+        self.comment_box.setMaximumBlockCount(3)
+        self.comment_box.setMinimumHeight(60)
+        self.comment_box.setStyleSheet("padding: 4px 8px; font-size: 10px; font-family: 'Segoe UI'; font-weight: normal;")
+        self.comment_box.setPlaceholderText("Enter notes for this frame...")
+        self.comment_box.textChanged.connect(self.update_char_count)
+        self.canvas.set_comment_box(self.comment_box)
+
+        self.comment_box.setFocusPolicy(QtCore.Qt.ClickFocus)
+        self.comment_box.installEventFilter(self)
+        self.canvas.installEventFilter(self)
+
+        self.lock_toggle = QtWidgets.QPushButton("Lock")
+        self.lock_toggle.setCheckable(True)
+        self.lock_toggle.setToolTip("Toggle lock on canvas and notes")
+        self.lock_toggle.setFixedSize(50, 24)
+
+        self.draw_btn = QtWidgets.QPushButton("Draw Tool")
+        self.erase_btn = QtWidgets.QPushButton("Eraser Tool")
+        self.reset_btn = QtWidgets.QPushButton("Reset Canvas")
+        self.undo_btn = QtWidgets.QPushButton("Undo")
+        self.save_btn = QtWidgets.QPushButton("Save Image")
+        self.screenshot_btn = QtWidgets.QPushButton("Import Viewport Screenshot")
+        self.jump_btn = QtWidgets.QPushButton("Jump to Frame with Notes")
+        self.clear_all_btn = QtWidgets.QPushButton("Clear All Canvases")
+
+        self.color_picker_btn = QtWidgets.QPushButton("Choose Color")
+        self.color_preview = QtWidgets.QLabel()
+        self.color_preview.setFixedSize(20, 20)
+        self.color_preview.setStyleSheet("background-color: black;")
+
+        self.size_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.size_slider.setMinimum(1)
+        self.size_slider.setMaximum(10)
+        self.size_slider.setValue(3)
+        self.size_label = QtWidgets.QLabel("Brush Size: 3")
+
+        self.char_count_label = QtWidgets.QLabel("0 / 200")
+
+        self.init_ui()
+        self.connect_signals()
+
+    def init_ui(self):
+        tool_box = QtWidgets.QGroupBox("Tools")
+        tool_layout = QtWidgets.QHBoxLayout()
+        tool_layout.addWidget(self.draw_btn)
+        tool_layout.addWidget(self.erase_btn)
+        tool_layout.addWidget(self.undo_btn)
+        tool_layout.addWidget(self.reset_btn)
+        tool_layout.addWidget(self.save_btn)
+        tool_box.setLayout(tool_layout)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(tool_box)
+
+        size_layout = QtWidgets.QHBoxLayout()
+        size_layout.addWidget(self.size_label)
+        size_layout.addWidget(self.size_slider)
+
+        color_layout = QtWidgets.QHBoxLayout()
+        color_layout.addWidget(QtWidgets.QLabel("Color:"))
+        color_layout.addWidget(self.color_preview)
+        color_layout.addWidget(self.color_picker_btn)
+        color_layout.addStretch()
+
+        nav_layout = QtWidgets.QHBoxLayout()
+        nav_layout.addWidget(self.jump_btn)
+        nav_layout.addWidget(self.clear_all_btn)
+
+        layout.addLayout(size_layout)
+        layout.addLayout(color_layout)
+        layout.addLayout(nav_layout)
+        layout.addWidget(self.screenshot_btn)
+
+        frame_bar = QtWidgets.QHBoxLayout()
+        frame_bar.addWidget(self.frame_label)
+        frame_bar.addStretch()
+        frame_bar.addWidget(self.lock_toggle)
+
+        layout.addLayout(frame_bar)
+        layout.addWidget(self.canvas)
+
+        char_counter_layout = QtWidgets.QHBoxLayout()
+        char_counter_layout.addStretch()
+        char_counter_layout.addWidget(self.char_count_label)
+
+        layout.addWidget(self.comment_box)
+        layout.addLayout(char_counter_layout)
+
+    def connect_signals(self):
+        self.lock_toggle.toggled.connect(self.toggle_lock)
+        self.draw_btn.clicked.connect(lambda: self.canvas.set_drawing_mode(True))
+        self.erase_btn.clicked.connect(lambda: self.canvas.set_drawing_mode(False))
+        self.reset_btn.clicked.connect(self.canvas.reset_canvas)
+        self.undo_btn.clicked.connect(self.canvas.undo)
+        self.save_btn.clicked.connect(self.canvas.save_to_image)
+        self.screenshot_btn.clicked.connect(self.canvas.import_viewport_screenshot)
+        self.size_slider.valueChanged.connect(self.update_brush_size)
+        self.color_picker_btn.clicked.connect(self.open_color_dialog)
+        self.jump_btn.clicked.connect(self.jump_to_notes)
+        self.clear_all_btn.clicked.connect(self.confirm_clear_all)
+
+    def update_brush_size(self, value):
+        self.canvas.set_pen_width(value)
+        self.size_label.setText(f"Brush Size: {value}")
+
+    def open_color_dialog(self):
+        color = QtWidgets.QColorDialog.getColor(self.canvas.pen_color, self, "Select Brush Color")
+        if color.isValid():
+            self.canvas.set_pen_color(color)
+            self.color_preview.setStyleSheet(f"background-color: {color.name()}")
+
+    def jump_to_notes(self):
+        frames = self.canvas.get_frames_with_notes()
+        if frames:
+            frame, ok = QtWidgets.QInputDialog.getItem(self, "Jump to Frame", "Choose frame:", [str(f) for f in frames], 0, False)
+            if ok:
+                self.canvas.jump_to_frame(int(frame))
+        else:
+            QtWidgets.QMessageBox.information(self, "No Notes", "No frames with notes found.")
+
+    def toggle_lock(self, locked):
+        self.canvas.setEnabled(not locked)
+        self.comment_box.setReadOnly(locked)
+
+    def confirm_clear_all(self):
+        reply = QtWidgets.QMessageBox.question(self, "Confirm Clear", "Are you sure you want to clear all canvases and comments?", QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        if reply == QtWidgets.QMessageBox.Yes:
+            self.canvas.clear_all_canvases()
+
+# Launch safely
+_window_instance = None
+
+def launch_drawing_tool():
+    global _window_instance
+    if _window_instance is not None:
+        try:
+            _window_instance.close()
+            _window_instance.deleteLater()
+        except:
+            pass
+
+    _window_instance = DrawingToolUI()
+    _window_instance.show()
+
+launch_drawing_tool()
