@@ -1,0 +1,354 @@
+import maya.cmds as cmds
+from PySide2 import QtWidgets, QtCore, QtGui
+from shiboken2 import wrapInstance
+import maya.OpenMayaUI as omui
+from maya.app.general.mayaMixin import MayaQWidgetDockableMixin
+
+UI_TITLE = "Key Information"
+WINDOW_OBJECT_NAME = "KeyInformationDockableWindow"
+TANGENT_TYPES = {
+    "Auto": "auto",
+    "Clamped": "clamped",
+    "Flat": "flat",
+    "Linear": "linear",
+    "Plateau": "plateau",
+    "Spline": "spline",
+    "Step Next": "stepnext",
+    "Step": "step"
+}
+
+def get_maya_main_window():
+    main_window_ptr = omui.MQtUtil.mainWindow()
+    return wrapInstance(int(main_window_ptr), QtWidgets.QMainWindow)
+
+def delete_existing():
+    if cmds.window(WINDOW_OBJECT_NAME, exists=True):
+        cmds.deleteUI(WINDOW_OBJECT_NAME, window=True)
+    if cmds.workspaceControl(WINDOW_OBJECT_NAME + "WorkspaceControl", exists=True):
+        cmds.deleteUI(WINDOW_OBJECT_NAME + "WorkspaceControl", control=True)
+
+class KeyInformationWindow(MayaQWidgetDockableMixin, QtWidgets.QWidget):
+    MAX_DISPLAY_KEYS = 100
+
+    def __init__(self, parent=None):
+        super(KeyInformationWindow, self).__init__(parent)
+        font = QtGui.QFont("Segoe UI", 8)
+        self.setFont(font)
+        self.setObjectName(WINDOW_OBJECT_NAME)
+        self.setWindowTitle(UI_TITLE)
+        self.setMinimumSize(400, 250)
+        self.comboBoxActive = 0
+        self.rows = []
+
+        self.build_ui()
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.update_key_info)
+        self.timer.start(500)
+
+    def build_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+
+        header = QtWidgets.QHBoxLayout()
+        self.filter_dropdown = QtWidgets.QComboBox()
+        self.filter_dropdown.addItems(["All", "Translate", "Rotate", "Scale", "Custom"])
+        self.filter_dropdown.setFixedWidth(100)
+        self.filter_dropdown.currentIndexChanged.connect(self.apply_filter)
+        self.key_count_label = QtWidgets.QLabel("Keys Selected: 0")
+        self.key_count_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        header.addWidget(self.filter_dropdown)
+        header.addWidget(self.key_count_label)
+        layout.addLayout(header)
+        divider = QtWidgets.QFrame()
+        divider.setFrameShape(QtWidgets.QFrame.HLine)
+        divider.setFrameShadow(QtWidgets.QFrame.Sunken)
+        layout.addWidget(divider)
+
+        
+
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll_content = QtWidgets.QWidget()
+        self.scroll_layout = QtWidgets.QGridLayout(self.scroll_content)
+        self.scroll_layout.setSpacing(1)
+        self.scroll_layout.setAlignment(QtCore.Qt.AlignTop)
+        self.scroll.setWidget(self.scroll_content)
+        layout.addWidget(self.scroll)
+
+    def update_key_info(self):
+        scroll_bar = self.scroll.verticalScrollBar()
+        scroll_pos = scroll_bar.value()
+        for row in self.rows:
+            row.setParent(None)
+        self.rows.clear()
+
+        total_keys = 0
+        displayed_keys = 0
+
+        anim_curves = cmds.ls(selection=True, type="animCurve")
+        if not anim_curves:
+            sel = cmds.ls(sl=True)
+            if sel:
+                anim_curves = cmds.listConnections(sel, type="animCurve") or []
+
+        for curve in anim_curves:
+            sel_keys = cmds.keyframe(curve, query=True, selected=True)
+            if not sel_keys:
+                continue
+
+            attr_plug = cmds.listConnections(curve + ".output", plugs=True)
+            if attr_plug:
+                full_attr = attr_plug[0]
+                node, attr_name = full_attr.split('.', 1)
+            else:
+                node, attr_name = curve, "<disconnected>"
+
+            is_custom = not cmds.attributeQuery(attr_name, node=node, exists=True)
+            attr_type = self.get_attr_type(attr_name, is_custom)
+
+            for key_time in sel_keys:
+                total_keys += 1
+                if displayed_keys >= self.MAX_DISPLAY_KEYS:
+                    continue
+
+                value = cmds.keyframe(curve, query=True, time=(key_time, key_time), valueChange=True)[0]
+                in_type = cmds.keyTangent(curve, query=True, time=(key_time, key_time), inTangentType=True)[0]
+                out_type = cmds.keyTangent(curve, query=True, time=(key_time, key_time), outTangentType=True)[0]
+
+                row = KeyRowWidget(node, attr_name, curve, key_time, value, in_type, out_type, is_custom, self)
+                row.attr_type = attr_type
+                row.is_custom = is_custom
+                self.scroll_layout.addWidget(row)
+                self.rows.append(row)
+                displayed_keys += 1
+
+        label = f"Keys Selected: {total_keys}"
+        if total_keys > self.MAX_DISPLAY_KEYS:
+            label += f" (showing first {self.MAX_DISPLAY_KEYS})"
+        self.key_count_label.setText(label)
+        self.apply_filter()
+        QtCore.QTimer.singleShot(0, lambda: scroll_bar.setValue(scroll_pos))
+
+    def get_attr_type(self, attr_name, is_custom):
+        if is_custom:
+            return "custom"
+        name = attr_name.lower()
+        if name.startswith("translate"):
+            return "translate"
+        elif name.startswith("rotate"):
+            return "rotate"
+        elif name.startswith("scale"):
+            return "scale"
+        return "other"
+
+    def apply_filter(self):
+        selected = self.filter_dropdown.currentText().lower()
+        for row in self.rows:
+            show = (
+                selected == "all" or
+                (selected == "custom" and row.is_custom) or
+                (selected == row.attr_type)
+            )
+            row.setVisible(show)
+
+# --- KeyRowWidget class definition ---
+class ManagedLineEdit(QtWidgets.QLineEdit):
+    def __init__(self, text, parent):
+        super().__init__(text)
+        self.parent_row = parent
+
+    def focusInEvent(self, event):
+        self.parent_row.parent_window.timer.stop()
+        super().focusInEvent(event)
+
+    def focusOutEvent(self, event):
+        QtCore.QTimer.singleShot(200, self.parent_row.parent_window.timer.start)
+        super().focusOutEvent(event)
+
+
+class ManagedComboBox(QtWidgets.QComboBox):
+    def __init__(self, parent):
+        super().__init__()
+        self.parent_row = parent
+
+    def showPopup(self):
+        self.parent_row.parent_window.timer.stop()
+        super().showPopup()
+
+    def hidePopup(self):
+        super().hidePopup()
+        QtCore.QTimer.singleShot(200, self.parent_row.parent_window.timer.start)
+
+
+class KeyRowWidget(QtWidgets.QWidget):
+    def __init__(self, node, attr_name, curve, time, value, in_type, out_type, is_custom, parent_window):
+        super(KeyRowWidget, self).__init__()
+        self.node = node
+        self.attr_name = attr_name
+        self.curve = curve
+        self.original_time = time
+        self.parent_window = parent_window
+
+        layout = QtWidgets.QGridLayout(self)
+        layout.setContentsMargins(2, 1, 2, 1)
+        layout.setSpacing(2)
+
+        name_container = QtWidgets.QHBoxLayout()
+        ctrl_label = QtWidgets.QLabel(node)
+        ctrl_label.setMaximumWidth(80)
+        attr_label = QtWidgets.QLabel(attr_name)
+        attr_label.setMaximumWidth(100)
+        if is_custom:
+            attr_label.setStyleSheet("color: #2f6fff")
+        name_container.addWidget(ctrl_label)
+        divider = QtWidgets.QFrame()
+        divider.setFrameShape(QtWidgets.QFrame.VLine)
+        divider.setFrameShadow(QtWidgets.QFrame.Sunken)
+        name_container.addWidget(divider)
+        name_container.addWidget(attr_label)
+        name_container.setSpacing(4)
+        layout.addLayout(name_container, 0, 0, 1, 2)
+
+        self.frame_edit = ManagedLineEdit(str(time), self)
+        self.frame_edit.setFixedWidth(30)
+        self.frame_edit.setAlignment(QtCore.Qt.AlignCenter)
+        self.frame_edit.installEventFilter(self)
+        self.frame_edit.editingFinished.connect(self.apply_frame)
+        layout.addWidget(self.frame_edit, 0, 2)
+
+        self.value_edit = ManagedLineEdit(f"{value:.3f}", self)
+        self.value_edit.setFixedWidth(40)
+        self.value_edit.setAlignment(QtCore.Qt.AlignCenter)
+        self.value_edit.installEventFilter(self)
+        self.value_edit.editingFinished.connect(self.apply_value)
+        layout.addWidget(self.value_edit, 0, 3)
+
+        self.in_dropdown = ManagedComboBox(self)
+        self.in_dropdown.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.in_dropdown.installEventFilter(self)
+        self.in_dropdown.addItems(sorted(TANGENT_TYPES.keys()))
+        for label, value in TANGENT_TYPES.items():
+            if value == in_type:
+                self.in_dropdown.setCurrentText(label)
+                break
+        self.in_dropdown.setFixedWidth(60)
+        self.in_dropdown.setFixedHeight(22)
+        self.in_dropdown.activated.connect(self.apply_tangent)
+        layout.addWidget(self.in_dropdown, 0, 4)
+
+        self.out_dropdown = ManagedComboBox(self)
+        self.out_dropdown.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.out_dropdown.installEventFilter(self)
+        self.out_dropdown.addItems(sorted(TANGENT_TYPES.keys()))
+        for label, value in TANGENT_TYPES.items():
+            if value == out_type:
+                self.out_dropdown.setCurrentText(label)
+                break
+        self.out_dropdown.setFixedWidth(60)
+        self.out_dropdown.setFixedHeight(22)
+        self.out_dropdown.activated.connect(self.apply_tangent)
+        layout.addWidget(self.out_dropdown, 0, 5)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        for label, tooltip, callback in [
+            ("+", "Insert key", self.insert_key),
+            (">", "Jump to frame", self.jump_to_frame),
+            ("i", "Isolate curve", self.isolate_curve),
+            ("x", "Delete key", self.delete_key)
+        ]:
+            btn = QtWidgets.QPushButton(label)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #444;
+                    border: none;
+                    color: white;
+                }
+                QPushButton:hover {
+                    background-color: #555;
+                }
+            """)
+            btn.setFixedHeight(22)
+            btn.setFixedWidth(22)
+            btn.setToolTip(tooltip)
+            btn.clicked.connect(callback)
+            btn_row.addWidget(btn)
+
+        layout.addLayout(btn_row, 0, 6)
+
+    def apply_frame(self):
+        try:
+            new_frame = float(self.frame_edit.text())
+            if new_frame == self.original_time:
+                return
+            cmds.undoInfo(openChunk=True)
+            cmds.keyframe(self.curve, edit=True, time=(self.original_time, self.original_time), timeChange=new_frame)
+            self.original_time = new_frame
+            self.parent_window.update_key_info()
+        except Exception as e:
+            print(f"Frame error: {e}")
+        finally:
+            cmds.undoInfo(closeChunk=True)
+            cmds.undoInfo(closeChunk=True)
+
+    def apply_value(self):
+        try:
+            new_value = float(self.value_edit.text())
+            cmds.undoInfo(openChunk=True)
+            cmds.keyframe(self.curve, edit=True, time=(self.original_time, self.original_time), valueChange=new_value)
+        except Exception as e:
+            print(f"Value error: {e}")
+        finally:
+            cmds.undoInfo(closeChunk=True)
+
+    def apply_tangent(self):
+        try:
+            in_type = TANGENT_TYPES[self.in_dropdown.currentText()]
+            out_type = TANGENT_TYPES[self.out_dropdown.currentText()]
+            cmds.undoInfo(openChunk=True)
+            cmds.keyTangent(self.curve, edit=True, time=(self.original_time, self.original_time),
+                            inTangentType=in_type, outTangentType=out_type)
+            self.parent_window.update_key_info()  # Ensure UI reflects the new tangent immediately
+        except Exception as e:
+            print(f"Tangent error: {e}")
+        finally:
+            cmds.undoInfo(closeChunk=True)
+
+    def insert_key(self):
+        try:
+            current_time = cmds.currentTime(q=True)
+            value = cmds.getAttr(f"{self.node}.{self.attr_name}", time=current_time)
+            cmds.undoInfo(openChunk=True)
+            cmds.setKeyframe(self.node, attribute=self.attr_name, time=current_time, value=value)
+        except Exception as e:
+            print(f"Insert key error: {e}")
+        finally:
+            cmds.undoInfo(closeChunk=True)
+
+    def jump_to_frame(self):
+        try:
+            cmds.currentTime(self.original_time, edit=True)
+        except Exception as e:
+            print(f"Jump to frame error: {e}")
+
+    def isolate_curve(self):
+        try:
+            cmds.select(self.curve, replace=True)
+            cmds.selectKey(self.curve, time=(self.original_time, self.original_time), add=True)
+        except Exception as e:
+            print(f"Isolate curve error: {e}")
+
+    def delete_key(self):
+        try:
+            cmds.undoInfo(openChunk=True)
+            cmds.cutKey(self.curve, time=(self.original_time, self.original_time), clear=True)
+        except Exception as e:
+            print(f"Delete key error: {e}")
+        finally:
+            cmds.undoInfo(closeChunk=True)
+
+
+def launch_key_information():
+    delete_existing()
+    window = KeyInformationWindow(parent=get_maya_main_window())
+    window.show(dockable=True)
+
+launch_key_information()
