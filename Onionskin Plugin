@@ -1,0 +1,213 @@
+import maya.cmds as cmds
+
+ghost_objects = []
+before_shader = None
+after_shader = None
+ui_window = "onionSkinUI"
+time_script_job = None
+tracked_object = None
+last_frame = None
+auto_skin_enabled = True  # Toggle for automatic onion skin updates
+
+# Reduced visibility: 5%, 10%, 25%, full
+visibility_to_transparency = {
+    0: 1.0,   # fully hidden
+    1: 0.95,  # 5% visible
+    2: 0.90,  # 10%
+    3: 0.75,  # 25%
+    4: 0.0    # fully visible
+}
+
+# Default settings
+before_count = 2
+after_count = 2
+before_color = [1, 0, 0]
+after_color = [0, 0, 1]
+before_visibility = 4
+after_visibility = 4
+
+def create_transparent_shader(name, color, visibility_level):
+    transparency = visibility_to_transparency.get(visibility_level, 1.0)
+    if not cmds.objExists(name):
+        shader = cmds.shadingNode('lambert', asShader=True, name=name)
+        shaderSG = cmds.sets(renderable=True, noSurfaceShader=True, empty=True, name=name + "SG")
+        cmds.connectAttr(shader + ".outColor", shaderSG + ".surfaceShader", force=True)
+    else:
+        shader = name
+    cmds.setAttr(shader + ".color", *color, type="double3")
+    cmds.setAttr(shader + ".transparency", transparency, transparency, transparency, type="double3")
+    return shader
+
+def clear_ghosts():
+    global ghost_objects
+    for obj in ghost_objects:
+        if cmds.objExists(obj):
+            cmds.delete(obj)
+    ghost_objects = []
+
+def update_onion_skins_on_frame_change():
+    global last_frame, tracked_object, auto_skin_enabled
+
+    if not auto_skin_enabled:
+        return
+
+    current_frame = int(cmds.currentTime(query=True))
+    if current_frame == last_frame:
+        return
+
+    last_frame = current_frame
+
+    if not tracked_object or not cmds.objExists(tracked_object):
+        return
+
+    create_onion_skins_for_frame(current_frame)
+
+def create_onion_skins_for_frame(frame):
+    global ghost_objects, before_shader, after_shader
+    global before_count, after_count, before_color, after_color
+    global before_visibility, after_visibility, tracked_object
+
+    clear_ghosts()
+
+    before_shader = create_transparent_shader("beforeOnionShader", before_color, before_visibility)
+    after_shader = create_transparent_shader("afterOnionShader", after_color, after_visibility)
+
+    cmds.currentTime(frame, edit=True)
+
+    for i in range(1, before_count + 1):
+        cmds.currentTime(frame - i, edit=True)
+        ghost = cmds.duplicate(tracked_object, name=f"{tracked_object}_ghost_before_{i}")[0]
+        ghost_objects.append(ghost)
+        finalize_ghost(ghost, before_shader, before_visibility)
+
+    for i in range(1, after_count + 1):
+        cmds.currentTime(frame + i, edit=True)
+        ghost = cmds.duplicate(tracked_object, name=f"{tracked_object}_ghost_after_{i}")[0]
+        ghost_objects.append(ghost)
+        finalize_ghost(ghost, after_shader, after_visibility)
+
+    cmds.currentTime(frame, edit=True)
+    cmds.select(tracked_object, replace=True)
+
+def finalize_ghost(ghost, shader_name, visibility_level):
+    cmds.delete(ghost, constructionHistory=True)
+    cmds.setAttr(ghost + ".overrideEnabled", 1)
+    cmds.setAttr(ghost + ".overrideDisplayType", 2)
+    cmds.setAttr(ghost + ".castsShadows", 0)
+    cmds.setAttr(ghost + ".receiveShadows", 0)
+    cmds.setAttr(ghost + ".visibility", visibility_level > 0)
+    cmds.sets(ghost, edit=True, forceElement=shader_name + "SG")
+
+def toggle_visibility(*args):
+    if not ghost_objects:
+        cmds.warning("No onion skin frames found.")
+        return
+    is_visible = cmds.getAttr(ghost_objects[0] + ".visibility")
+    for obj in ghost_objects:
+        if cmds.objExists(obj):
+            cmds.setAttr(obj + ".visibility", not is_visible)
+
+def choose_color(is_before=True):
+    result = cmds.colorEditor()
+    if cmds.colorEditor(query=True, result=True):
+        rgb = [cmds.colorEditor(query=True, rgbValue=True)[i] for i in range(3)]
+        if is_before:
+            global before_color
+            before_color = rgb
+        else:
+            global after_color
+            after_color = rgb
+
+def update_frame_count(attr_name, value):
+    global before_count, after_count
+    value = int(value)
+    if attr_name == "before":
+        before_count = value
+    else:
+        after_count = value
+
+def update_visibility(attr_name, value):
+    global before_visibility, after_visibility
+    value = int(value)
+    if attr_name == "before":
+        before_visibility = value
+    else:
+        after_visibility = value
+
+def toggle_auto_skin(state):
+    global auto_skin_enabled
+    auto_skin_enabled = state
+
+def start_time_script_job():
+    global time_script_job
+    if time_script_job:
+        try:
+            cmds.scriptJob(kill=time_script_job, force=True)
+        except:
+            pass
+    time_script_job = cmds.scriptJob(event=["timeChanged", update_onion_skins_on_frame_change], protected=True)
+
+def kill_time_script_job():
+    global time_script_job
+    if time_script_job:
+        try:
+            cmds.scriptJob(kill=time_script_job, force=True)
+        except:
+            pass
+    time_script_job = None
+
+def start_onion_skinning(*args):
+    global tracked_object, last_frame
+    selected = cmds.ls(selection=True, long=True)
+    if not selected:
+        cmds.warning("Please select a mesh or rig to track.")
+        return
+    tracked_object = selected[0]
+    last_frame = None
+    current_frame = int(cmds.currentTime(query=True))
+    create_onion_skins_for_frame(current_frame)
+    if auto_skin_enabled:
+        start_time_script_job()
+
+def show_ui():
+    global before_count, after_count, before_visibility, after_visibility, auto_skin_enabled
+
+    kill_time_script_job()
+
+    if cmds.window(ui_window, exists=True):
+        cmds.deleteUI(ui_window)
+
+    cmds.window(ui_window, title="Onion Skin Tool", widthHeight=(350, 420))
+    cmds.columnLayout(adjustableColumn=True, rowSpacing=10)
+
+    cmds.button(label="Create Onion Skins", command=start_onion_skinning)
+    cmds.button(label="Toggle Onion Skin Visibility", command=toggle_visibility)
+    cmds.button(label="Clear Onion Skins", command=lambda x: [kill_time_script_job(), clear_ghosts()])
+    cmds.checkBox(label="Auto-Onion", value=auto_skin_enabled, changeCommand=toggle_auto_skin)
+
+    cmds.separator(style='in', height=10)
+    cmds.text(label="Color Settings:")
+    cmds.button(label="Choose BEFORE frame color", command=lambda x: choose_color(is_before=True))
+    cmds.button(label="Choose AFTER frame color", command=lambda x: choose_color(is_before=False))
+
+    cmds.separator(style='in', height=10)
+    cmds.text(label="Frame Count Settings (0–4):")
+    cmds.intSliderGrp('beforeSlider', label='Previous Frames', field=True, min=0, max=4, value=before_count,
+                      columnAlign=(1, 'left'), changeCommand=lambda val: update_frame_count("before", val))
+    cmds.intSliderGrp('afterSlider', label='Upcoming Frames', field=True, min=0, max=4, value=after_count,
+                      columnAlign=(1, 'left'), changeCommand=lambda val: update_frame_count("after", val))
+
+    cmds.separator(style='in', height=10)
+    cmds.text(label="Visibility Settings (0–4):")
+    cmds.text(label="0 = Hidden, 1 = 5%, 2 = 10%, 3 = 25%, 4 = Full")
+    cmds.intSliderGrp('beforeVisSlider', label='Previous Frame Visibility', field=True, min=0, max=4,
+                      value=before_visibility, columnAlign=(1, 'left'),
+                      changeCommand=lambda val: update_visibility("before", val))
+    cmds.intSliderGrp('afterVisSlider', label='Upcoming Frame Visibility', field=True, min=0, max=4,
+                      value=after_visibility, columnAlign=(1, 'left'),
+                      changeCommand=lambda val: update_visibility("after", val))
+
+    cmds.showWindow(ui_window)
+
+# Launch the UI
+show_ui()
