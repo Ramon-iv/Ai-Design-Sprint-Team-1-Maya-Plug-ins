@@ -8,4 +8,4 @@ This plugin kit includes the following Maya plugins:
 - Jitter
 - Pose Saver
 
-All plugins are programmed in Python and compatible with Maya 2024
+All plugins are programmed in Python, functioning, and compatible with Maya 2024
