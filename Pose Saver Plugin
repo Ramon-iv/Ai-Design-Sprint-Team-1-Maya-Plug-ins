@@ -1,0 +1,352 @@
+import maya.cmds as cmds
+import maya.mel as mel
+import json
+import os
+
+# === Pose Saver Core ===
+POSE_LIBRARY = {}
+UNDO_BUFFER = {}
+FOLDER_UNDO_BUFFER = {}
+FOLDER_PINNED = set()
+POSES_FILE_PATH = os.path.join(cmds.internalVar(userAppDir=True), "pose_data.json")
+
+def save_all_poses_to_disk():
+    try:
+        with open(POSES_FILE_PATH, "w") as f:
+            json.dump({'library': POSE_LIBRARY, 'pinned': list(FOLDER_PINNED)}, f, indent=2)
+    except Exception as e:
+        cmds.warning(f"Failed to save poses: {e}")
+
+def load_poses_from_disk():
+    global POSE_LIBRARY, FOLDER_PINNED
+    if os.path.exists(POSES_FILE_PATH):
+        try:
+            with open(POSES_FILE_PATH, "r") as f:
+                data = json.load(f)
+                POSE_LIBRARY = data.get('library', {})
+                FOLDER_PINNED = set(data.get('pinned', []))
+        except Exception as e:
+            cmds.warning(f"Failed to load poses: {e}")
+
+def get_sorted_folders():
+    pinned = sorted([f for f in POSE_LIBRARY if f in FOLDER_PINNED])
+    others = sorted([f for f in POSE_LIBRARY if f not in FOLDER_PINNED])
+    return pinned + others
+
+def get_selected_folder():
+    if not cmds.optionMenu("folderMenu", exists=True):
+        return None
+    val = cmds.optionMenu("folderMenu", q=True, value=True)
+    return val.replace("📌 ", "").strip() if val else None
+
+def refresh_folder_list():
+    if not cmds.optionMenu("folderMenu", exists=True):
+        return
+    current = get_selected_folder()
+    cmds.optionMenu("folderMenu", e=True, deleteAllItems=True)
+    for folder in get_sorted_folders():
+        label = f"📌 {folder}" if folder in FOLDER_PINNED else folder
+        cmds.menuItem(label=label, parent="folderMenu")
+    if current and current in POSE_LIBRARY:
+        cmds.optionMenu("folderMenu", e=True, value=current)
+    elif POSE_LIBRARY:
+        cmds.optionMenu("folderMenu", e=True, select=1)
+    refresh_pose_list()
+    refresh_move_folder_menu()
+
+def refresh_pose_list():
+    if not cmds.textScrollList("poseList", exists=True):
+        return
+    cmds.textScrollList("poseList", e=True, removeAll=True)
+    query = cmds.textField("poseSearchField", q=True, text=True).lower() if cmds.textField("poseSearchField", exists=True) else ""
+    if query:
+        for folder in sorted(POSE_LIBRARY.keys()):
+            for pose_name in sorted(POSE_LIBRARY[folder].keys()):
+                if query in pose_name.lower():
+                    cmds.textScrollList("poseList", e=True, append=f"{folder} : {pose_name}")
+    else:
+        folder = get_selected_folder()
+        if folder in POSE_LIBRARY:
+            for pose_name in sorted(POSE_LIBRARY[folder].keys()):
+                cmds.textScrollList("poseList", e=True, append=pose_name)
+
+def filter_pose_list(*args):
+    refresh_pose_list()
+
+def refresh_move_folder_menu():
+    if not cmds.optionMenu("moveFolderMenu", exists=True):
+        return
+    cmds.optionMenu("moveFolderMenu", e=True, deleteAllItems=True)
+    for folder in get_sorted_folders():
+        cmds.menuItem(label=folder, parent="moveFolderMenu")
+
+def parse_selected_pose():
+    sel = cmds.textScrollList("poseList", q=True, selectItem=True)
+    if not sel:
+        return None, None
+    selected = sel[0]
+    if " : " in selected:
+        folder, pose = selected.split(" : ", 1)
+    else:
+        folder = get_selected_folder()
+        pose = selected
+    return folder, pose
+
+def save_pose(*args):
+    folder = get_selected_folder()
+    if not folder:
+        cmds.warning("Please select a folder before saving a pose.")
+        return
+    sel = cmds.ls(selection=True)
+    if not sel:
+        cmds.warning("No objects selected.")
+        return
+    pose_name = cmds.textField("poseNameField", q=True, text=True)
+    if not pose_name:
+        cmds.warning("Enter a pose name.")
+        return
+    if folder not in POSE_LIBRARY:
+        POSE_LIBRARY[folder] = {}
+    pose_data = {}
+    for obj in sel:
+        attrs = cmds.listAttr(obj, keyable=True)
+        if not attrs:
+            continue
+        attr_data = {}
+        for attr in attrs:
+            full_attr = f"{obj}.{attr}"
+            try:
+                value = cmds.getAttr(full_attr)
+                attr_data[attr] = value
+            except:
+                continue
+        pose_data[obj] = attr_data
+    POSE_LIBRARY[folder][pose_name] = pose_data
+    save_all_poses_to_disk()
+    refresh_pose_list()
+    cmds.warning(f"Pose '{pose_name}' saved to folder '{folder}'.")
+
+def paste_pose(*args):
+    folder, pose_name = parse_selected_pose()
+    if not folder or not pose_name:
+        cmds.warning("Please select a pose to paste.")
+        return
+    pose_data = POSE_LIBRARY.get(folder, {}).get(pose_name, {})
+    key_flag = cmds.checkBox("keyPoseCheckbox", q=True, value=True)
+    for obj, attrs in pose_data.items():
+        if not cmds.objExists(obj):
+            continue
+        for attr, value in attrs.items():
+            full_attr = f"{obj}.{attr}"
+            try:
+                cmds.setAttr(full_attr, value)
+                if key_flag:
+                    cmds.setKeyframe(full_attr)
+            except:
+                continue
+    cmds.warning(f"Pasted pose: {pose_name}")
+
+def delete_pose(*args):
+    folder, pose_name = parse_selected_pose()
+    if not folder or not pose_name:
+        cmds.warning("Please select a pose to delete.")
+        return
+    if pose_name in POSE_LIBRARY.get(folder, {}):
+        UNDO_BUFFER.clear()
+        UNDO_BUFFER[(folder, pose_name)] = POSE_LIBRARY[folder][pose_name]
+        del POSE_LIBRARY[folder][pose_name]
+        save_all_poses_to_disk()
+        refresh_pose_list()
+        cmds.warning(f"Deleted pose: {pose_name}")
+
+def undo_delete(*args):
+    if not UNDO_BUFFER:
+        cmds.warning("Nothing to undo.")
+        return
+    for (folder, pose_name), pose_data in UNDO_BUFFER.items():
+        if folder not in POSE_LIBRARY:
+            POSE_LIBRARY[folder] = {}
+        POSE_LIBRARY[folder][pose_name] = pose_data
+    UNDO_BUFFER.clear()
+    save_all_poses_to_disk()
+    refresh_pose_list()
+
+def toggle_pin_folder(*args):
+    folder = get_selected_folder()
+    if not folder:
+        return
+    if folder in FOLDER_PINNED:
+        FOLDER_PINNED.remove(folder)
+    else:
+        FOLDER_PINNED.add(folder)
+    save_all_poses_to_disk()
+    refresh_folder_list()
+
+def rename_folder(*args):
+    folder = get_selected_folder()
+    if not folder:
+        return
+    result = cmds.promptDialog(title="Rename Folder", message="Enter new folder name:",
+                               button=["OK", "Cancel"], defaultButton="OK",
+                               cancelButton="Cancel", dismissString="Cancel")
+    if result == "OK":
+        new_name = cmds.promptDialog(q=True, text=True).strip()
+        if new_name and new_name != folder:
+            if new_name in POSE_LIBRARY:
+                cmds.warning("Folder already exists.")
+                return
+            POSE_LIBRARY[new_name] = POSE_LIBRARY.pop(folder)
+            if folder in FOLDER_PINNED:
+                FOLDER_PINNED.remove(folder)
+                FOLDER_PINNED.add(new_name)
+            save_all_poses_to_disk()
+            refresh_folder_list()
+
+def duplicate_folder(*args):
+    folder = get_selected_folder()
+    if not folder:
+        return
+    base = folder + "_copy"
+    new_name = base
+    i = 1
+    while new_name in POSE_LIBRARY:
+        new_name = f"{base}{i}"
+        i += 1
+    POSE_LIBRARY[new_name] = json.loads(json.dumps(POSE_LIBRARY[folder]))
+    save_all_poses_to_disk()
+    refresh_folder_list()
+
+def delete_folder(*args):
+    folder = get_selected_folder()
+    if not folder:
+        return
+    confirm = cmds.confirmDialog(title="Delete Folder",
+                                 message=f"Delete folder '{folder}' and all poses?",
+                                 button=["Yes", "Cancel"], defaultButton="Yes", cancelButton="Cancel")
+    if confirm == "Yes":
+        FOLDER_UNDO_BUFFER.clear()
+        FOLDER_UNDO_BUFFER[folder] = POSE_LIBRARY.pop(folder)
+        if folder in FOLDER_PINNED:
+            FOLDER_PINNED.remove(folder)
+        save_all_poses_to_disk()
+        refresh_folder_list()
+
+def undo_folder_delete(*args):
+    for folder, data in FOLDER_UNDO_BUFFER.items():
+        POSE_LIBRARY[folder] = data
+    FOLDER_UNDO_BUFFER.clear()
+    save_all_poses_to_disk()
+    refresh_folder_list()
+
+def create_new_folder(*args):
+    result = cmds.promptDialog(title="New Folder", message="Enter folder name:",
+                               button=["OK", "Cancel"], defaultButton="OK",
+                               cancelButton="Cancel", dismissString="Cancel")
+    if result == "OK":
+        folder = cmds.promptDialog(q=True, text=True).strip()
+        if folder and folder not in POSE_LIBRARY:
+            POSE_LIBRARY[folder] = {}
+            save_all_poses_to_disk()
+            refresh_folder_list()
+
+def move_pose_to_folder(*args):
+    folder, pose_name = parse_selected_pose()
+    to_folder = cmds.optionMenu("moveFolderMenu", q=True, value=True)
+    if not folder or not pose_name or not to_folder:
+        cmds.warning("Select a pose and destination folder.")
+        return
+    if folder == to_folder:
+        cmds.warning("Source and destination folders are the same.")
+        return
+    pose_data = POSE_LIBRARY[folder].pop(pose_name)
+    if to_folder not in POSE_LIBRARY:
+        POSE_LIBRARY[to_folder] = {}
+    POSE_LIBRARY[to_folder][pose_name] = pose_data
+    save_all_poses_to_disk()
+    refresh_folder_list()
+
+def build_pose_ui():
+    if cmds.window("poseToolWin", exists=True):
+        cmds.deleteUI("poseToolWin")
+    cmds.window("poseToolWin", title="Pose Saver", widthHeight=(420, 640))
+    cmds.columnLayout(adjustableColumn=True, rowSpacing=8)
+
+    cmds.text(label="Select Folder:")
+    cmds.rowLayout(numberOfColumns=2, adjustableColumn=1, columnAttach=[(1, "both", 5), (2, "both", 5)])
+    cmds.optionMenu("folderMenu", cc=lambda _: refresh_pose_list())
+    cmds.button(label="+ New Folder", command=create_new_folder)
+    cmds.setParent("..")
+
+    cmds.popupMenu(parent="folderMenu")
+    cmds.menuItem(label="📌 Pin/Unpin Folder", command=toggle_pin_folder)
+    cmds.menuItem(label="✏ Rename Folder", command=rename_folder)
+    cmds.menuItem(label="📄 Duplicate Folder", command=duplicate_folder)
+    cmds.menuItem(label="🗑 Delete Folder", command=delete_folder)
+
+    cmds.text(label="Pose Name:")
+    cmds.textField("poseNameField")
+    cmds.button(label="Save Pose", command=save_pose)
+    cmds.checkBox("keyPoseCheckbox", label="Key pose on paste", value=True)
+
+    cmds.text(label="Search Poses:")
+    cmds.textField("poseSearchField", cc=filter_pose_list)
+
+    cmds.text(label="Poses:")
+    cmds.textScrollList("poseList", height=200)
+
+    cmds.separator(h=10, style='in')
+    cmds.formLayout("buttonForm")
+    paste_btn = cmds.button(label="Paste Pose", command=paste_pose)
+    delete_btn = cmds.button(label="Delete Pose", command=delete_pose)
+    undo_btn = cmds.button(label="Undo Pose Delete", command=undo_delete)
+    cmds.formLayout("buttonForm", edit=True,
+        attachForm=[(paste_btn, "top", 0), (delete_btn, "top", 0), (undo_btn, "top", 0)],
+        attachPosition=[
+            (paste_btn, "left", 20, 0), (paste_btn, "right", 0, 50),
+            (delete_btn, "left", 0, 50), (delete_btn, "right", 0, 75),
+            (undo_btn, "left", 0, 75), (undo_btn, "right", 20, 100),
+        ])
+    cmds.setParent("..")
+
+    cmds.separator(h=12, style='in')
+    cmds.text(label="Move Pose to Another Folder:")
+    cmds.rowLayout(numberOfColumns=2, adjustableColumn=1)
+    cmds.optionMenu("moveFolderMenu")
+    cmds.button(label="Move Pose", command=move_pose_to_folder)
+    cmds.setParent("..")
+    cmds.button(label="Undo Folder Delete", command=undo_folder_delete, bgc=(0.5, 0.5, 0.7))
+
+    cmds.showWindow("poseToolWin")
+    load_poses_from_disk()
+    refresh_folder_list()
+
+# === Shelf Button Creation (Auto-detect active shelf) ===
+
+icon_file = 'pose_icon.png'
+icon_dir = os.path.expanduser('~/Library/Preferences/Autodesk/maya/2025/prefs/icons')
+icon_path = os.path.join(icon_dir, icon_file)
+
+if icon_dir not in os.environ.get('XBMLANGPATH', ''):
+    os.environ['XBMLANGPATH'] += ';' + icon_dir
+
+try:
+    target_shelf = cmds.tabLayout('ShelfLayout', query=True, selectTab=True)
+    if cmds.shelfLayout(target_shelf, exists=True):
+        cmds.setParent(target_shelf)
+        cmds.shelfButton(
+            label='Pose Tool',
+            command='build_pose_ui()',
+            image=icon_file,
+            imageOverlayLabel='',
+            sourceType='python',
+            style='iconOnly',
+            annotation='Open Pose Saver Tool'
+        )
+    else:
+        cmds.warning(f"Shelf '{target_shelf}' does not exist.")
+except Exception as e:
+    cmds.warning(f"Could not add shelf button: {e}")
+
+
+
+
