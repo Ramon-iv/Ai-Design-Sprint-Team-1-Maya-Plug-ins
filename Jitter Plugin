@@ -1,0 +1,151 @@
+import maya.cmds as cmds
+from PySide2 import QtWidgets, QtCore, QtGui
+import shiboken2
+import maya.OpenMayaUI as omui
+
+def get_maya_main_window():
+    ptr = omui.MQtUtil.mainWindow()
+    return shiboken2.wrapInstance(int(ptr), QtWidgets.QWidget)
+
+def jitter_severity(prev_val, curr_val, next_val):
+    if prev_val is None or next_val is None:
+        return 0.0
+    delta1 = curr_val - prev_val
+    delta2 = next_val - curr_val
+    severity = abs(delta2 - delta1)
+    return severity
+
+def get_keyed_controls_at_frame(frame, jitter_threshold=0.5, enabled_axes=None):
+    controls = cmds.ls(selection=True, type='transform')
+    if not controls:
+        controls = [ctrl for ctrl in cmds.ls(type='transform') if cmds.listConnections(ctrl, type='animCurve')]
+    if not controls:
+        return [], {}
+    keyed_controls = []
+    jitter_data = {}
+
+    for ctrl in controls:
+        anim_attrs = cmds.listAnimatable(ctrl) or []
+        for attr_path in anim_attrs:
+            attr = attr_path.split('.')[-1]
+            if enabled_axes and attr not in enabled_axes:
+                continue
+            attr = attr_path.split('.')[-1]
+            full_attr = f"{ctrl}.{attr}"
+            key_times = cmds.keyframe(full_attr, query=True, timeChange=True)
+            key_values = cmds.keyframe(full_attr, query=True, valueChange=True)
+
+            if not key_times or not key_values:
+                continue
+
+            if frame in key_times:
+                if ctrl not in keyed_controls:
+                    keyed_controls.append(ctrl)
+
+                index = key_times.index(frame)
+                prev_val = key_values[index - 1] if index > 0 else None
+                curr_val = key_values[index]
+                next_val = key_values[index + 1] if index < len(key_values) - 1 else None
+
+                severity = jitter_severity(prev_val, curr_val, next_val)
+                if severity > jitter_threshold:
+                    if ctrl not in jitter_data:
+                        jitter_data[ctrl] = []
+                    jitter_data[ctrl].append((attr, severity))
+
+    return keyed_controls, jitter_data
+
+def get_severity_color(severity):
+    if severity > 5.0:
+        return QtGui.QColor(255, 50, 50)  # noticeable - red
+    elif severity > 2.0:
+        return QtGui.QColor(255, 140, 0)  # concerning - dark orange
+    elif severity > 0.5:
+        return QtGui.QColor(255, 200, 100)  # slight - light orange
+    else:
+        return QtGui.QColor(200, 255, 200)  # smooth - pale green
+
+class SmartKeyFrameScan(QtWidgets.QDialog):
+    def __init__(self, parent=get_maya_main_window()):
+        super(SmartKeyFrameScan, self).__init__(parent)
+        self.setWindowTitle("SmartKey: Frame Analyzer")
+        self.setMinimumSize(800, 500)
+        self.setLayout(QtWidgets.QVBoxLayout())
+
+        self.frame_input = QtWidgets.QSpinBox()
+        self.frame_input.setMinimum(1)
+        self.frame_input.setMaximum(10000)
+        self.frame_input.setValue(int(cmds.currentTime(query=True)))
+        self.timeline_job = cmds.scriptJob(event=["timeChanged", self.sync_with_timeline], protected=True)
+        self.layout().addWidget(QtWidgets.QLabel("Enter Frame to Analyze:"))
+        self.layout().addWidget(self.frame_input)
+
+        self.filter_group = QtWidgets.QGroupBox("Attribute Axes")
+        self.filter_layout = QtWidgets.QHBoxLayout()
+        self.axis_checkboxes = {
+            'translateX': QtWidgets.QCheckBox('translateX'),
+            'translateY': QtWidgets.QCheckBox('translateY'),
+            'translateZ': QtWidgets.QCheckBox('translateZ'),
+            'rotateX': QtWidgets.QCheckBox('rotateX'),
+            'rotateY': QtWidgets.QCheckBox('rotateY'),
+            'rotateZ': QtWidgets.QCheckBox('rotateZ')
+        }
+        for key, cb in self.axis_checkboxes.items():
+            cb.setChecked(True)
+            self.filter_layout.addWidget(cb)
+        self.filter_group.setLayout(self.filter_layout)
+        self.layout().addWidget(self.filter_group)
+
+        self.analyze_button = QtWidgets.QPushButton("Analyze Frame")
+        self.analyze_button.clicked.connect(self.analyze_frame)
+        self.layout().addWidget(self.analyze_button)
+
+        self.result_table = QtWidgets.QTableWidget()
+        self.result_table.setColumnCount(3)
+        self.result_table.setHorizontalHeaderLabels(["Control", "Keyed Attributes", "Max Jitter Severity"])
+        self.result_table.horizontalHeader().setStretchLastSection(True)
+        self.result_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.layout().addWidget(self.result_table)
+
+    def sync_with_timeline(self):
+        current_frame = int(cmds.currentTime(query=True))
+        self.frame_input.blockSignals(True)
+        self.frame_input.setValue(current_frame)
+        self.frame_input.blockSignals(False)
+
+    def analyze_frame(self):
+        self.result_table.setRowCount(0)
+        frame = self.frame_input.value()
+        enabled_axes = [k for k, cb in self.axis_checkboxes.items() if cb.isChecked()]
+        keyed_controls, jitter_data = get_keyed_controls_at_frame(frame, enabled_axes=enabled_axes)
+
+        self.setWindowTitle(f"SmartKey: Frame {frame} Analysis – {len(keyed_controls)} Controls Keyed")
+
+        for row, ctrl in enumerate(keyed_controls):
+            attrs_info = jitter_data.get(ctrl, [])
+            attr_list = ", ".join(attr for attr, _ in attrs_info)
+            max_severity = max((sev for _, sev in attrs_info), default=0.0)
+
+            self.result_table.insertRow(row)
+
+            ctrl_item = QtWidgets.QTableWidgetItem(ctrl)
+            attr_item = QtWidgets.QTableWidgetItem(attr_list if attr_list else "-")
+            sev_item = QtWidgets.QTableWidgetItem(f"{max_severity:.2f}")
+
+            sev_item.setBackground(get_severity_color(max_severity))
+
+            self.result_table.setItem(row, 0, ctrl_item)
+            self.result_table.setItem(row, 1, attr_item)
+            self.result_table.setItem(row, 2, sev_item)
+
+# Run the panel
+try:
+    smartkey_scan.timeline_job
+    if cmds.scriptJob(exists=smartkey_scan.timeline_job):
+        cmds.scriptJob(kill=smartkey_scan.timeline_job, force=True)
+    smartkey_scan.close()
+    smartkey_scan.deleteLater()
+except:
+    pass
+smartkey_scan = SmartKeyFrameScan()
+smartkey_scan.show()
